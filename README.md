@@ -1,12 +1,14 @@
 # MediaPipe Face Landmarker Demo
 
-A small Python project for trying MediaPipe's Face Landmarker task with a webcam.
+A small Python project for trying MediaPipe's Face Landmarker task with a webcam or Intel RealSense D435i.
 
-The demo opens your default camera, detects one face, and draws MediaPipe face mesh landmarks on the video feed.
+The demos open a camera, detect one face, and draw MediaPipe face mesh landmarks on the video feed.
 
 ## Files
 
 - `webcam_face_landmarker.py` - webcam demo using MediaPipe Tasks Vision API
+- `realsense_face_landmarker.py` - Intel RealSense D435i color stream demo
+- `realsense_face_3d_sparse.py` - sparse RealSense depth reconstruction with colored 3D face feature lines
 - `requirements.txt` - Python dependencies
 - `models/face_landmarker.task` - downloaded automatically on first run
 
@@ -32,6 +34,22 @@ python webcam_face_landmarker.py
 ```
 
 Press `q` to close the webcam window.
+
+For an Intel RealSense D435i, connect the camera and run:
+
+```bash
+python realsense_face_landmarker.py
+```
+
+Press `q` to close the RealSense window.
+
+For sparse 3D head reconstruction from the RealSense depth map, run:
+
+```bash
+python realsense_face_3d_sparse.py
+```
+
+Close the Matplotlib 3D window or press `q` in the RGB detection window to stop the renderer. Eyes are drawn in cyan, eyebrows in yellow, and the mouth in red.
 
 On the first run, the script downloads the official MediaPipe face landmarker model into `models/`.
 
