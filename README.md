@@ -9,6 +9,7 @@ The demos open a camera, detect one face, and draw MediaPipe face mesh landmarks
 - `webcam_face_landmarker.py` - webcam demo using MediaPipe Tasks Vision API
 - `realsense_face_landmarker.py` - Intel RealSense D435i color stream demo
 - `realsense_face_3d_sparse.py` - sparse RealSense depth reconstruction with colored 3D face feature lines
+- `realsense_face_coordinate_udp.py` - headless filtered face coordinate frame sender over UDP
 - `requirements.txt` - Python dependencies
 - `models/face_landmarker.task` - downloaded automatically on first run
 
@@ -50,6 +51,14 @@ python realsense_face_3d_sparse.py
 ```
 
 Close the Matplotlib 3D window or press `q` in the RGB detection window to stop the renderer. Eyes are drawn in cyan, eyebrows in yellow, and the mouth in red.
+
+For a headless filtered coordinate-frame stream over UDP, run:
+
+```bash
+python realsense_face_coordinate_udp.py --udp-host 127.0.0.1 --udp-port 5005
+```
+
+Use `--net=host` for the ROS 2 Docker container if you want `127.0.0.1:5005` to be shared between host and container.
 
 On the first run, the script downloads the official MediaPipe face landmarker model into `models/`.
 
