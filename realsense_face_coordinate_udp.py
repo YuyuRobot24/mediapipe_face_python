@@ -24,6 +24,9 @@ MODEL_URL = (
     "face_landmarker/float16/latest/face_landmarker.task"
 )
 MODEL_PATH = Path("models/face_landmarker.task")
+RGB_WINDOW_NAME = "RealSense RGB Face Detection - press q to quit"
+SPARSE_WINDOW_NAME = "RealSense Sparse Face Coordinate Debug"
+AXIS_LENGTH_METERS = 0.12
 
 LEFT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
@@ -119,6 +122,21 @@ def landmark_pixels(face_landmarks: list, width: int, height: int) -> list[tuple
     return pixels
 
 
+def face_bounds(pixels: list[tuple[int, int]], width: int, height: int) -> tuple[int, int, int, int]:
+    xs = np.array([pixel[0] for pixel in pixels])
+    ys = np.array([pixel[1] for pixel in pixels])
+    x_min, x_max = int(xs.min()), int(xs.max())
+    y_min, y_max = int(ys.min()), int(ys.max())
+    pad_x = int((x_max - x_min) * 0.25)
+    pad_y = int((y_max - y_min) * 0.35)
+    return (
+        max(0, x_min - pad_x),
+        min(width - 1, x_max + pad_x),
+        max(0, y_min - pad_y),
+        min(height - 1, y_max + pad_y),
+    )
+
+
 def nearby_depth(depth_frame: rs.depth_frame, x: int, y: int, radius: int = 4) -> float:
     width = depth_frame.get_width()
     height = depth_frame.get_height()
@@ -158,6 +176,44 @@ def mean_landmark_point(
     if len(points) < 3:
         return None
     return np.mean(np.asarray(points), axis=0)
+
+
+def sparse_head_cloud(
+    color_frame: np.ndarray,
+    depth_frame: rs.depth_frame,
+    intrinsics: rs.intrinsics,
+    bounds: tuple[int, int, int, int],
+    stride: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    x_min, x_max, y_min, y_max = bounds
+    points = []
+    colors = []
+    depth_samples = []
+
+    for y in range(y_min, y_max + 1, stride):
+        for x in range(x_min, x_max + 1, stride):
+            depth = depth_frame.get_distance(x, y)
+            if depth > 0.0:
+                depth_samples.append(depth)
+
+    if not depth_samples:
+        return np.empty((0, 3)), np.empty((0, 3))
+
+    median_depth = float(np.median(depth_samples))
+    min_depth = max(0.15, median_depth - 0.18)
+    max_depth = median_depth + 0.18
+
+    for y in range(y_min, y_max + 1, stride):
+        for x in range(x_min, x_max + 1, stride):
+            depth = depth_frame.get_distance(x, y)
+            if depth <= 0.0 or depth < min_depth or depth > max_depth:
+                continue
+
+            point = rs.rs2_deproject_pixel_to_point(intrinsics, [x, y], depth)
+            points.append([point[0], point[1], point[2]])
+            colors.append(color_frame[y, x, ::-1] / 255.0)
+
+    return np.asarray(points), np.asarray(colors)
 
 
 def normalize(vector: np.ndarray) -> np.ndarray | None:
@@ -269,6 +325,133 @@ def frame_to_payload(frame: FaceFrame, sequence: int, timestamp_ms: int) -> dict
     }
 
 
+def coordinate_axes(
+    frame: FaceFrame | None,
+) -> list[tuple[str, np.ndarray, np.ndarray, tuple[float, float, float]]]:
+    if frame is None:
+        return []
+
+    origin = frame.origin
+    return [
+        ("face X", origin, origin + frame.x_axis * AXIS_LENGTH_METERS, (1.0, 0.1, 0.1)),
+        ("face Y", origin, origin + frame.y_axis * AXIS_LENGTH_METERS, (0.1, 1.0, 0.1)),
+        ("face Z", origin, origin + frame.z_axis * AXIS_LENGTH_METERS, (0.2, 0.45, 1.0)),
+    ]
+
+
+def draw_2d_detection(display_image: np.ndarray, face_landmarks: list) -> None:
+    for landmarks in face_landmarks:
+        vision.drawing_utils.draw_landmarks(
+            display_image,
+            landmarks,
+            vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
+            connection_drawing_spec=vision.drawing_styles.get_default_face_mesh_tesselation_style(),
+            landmark_drawing_spec=None,
+        )
+        vision.drawing_utils.draw_landmarks(
+            display_image,
+            landmarks,
+            vision.FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
+            connection_drawing_spec=vision.drawing_styles.get_default_face_mesh_contours_style(),
+            landmark_drawing_spec=None,
+        )
+
+
+class DebugVisualizer:
+    def __init__(self) -> None:
+        import matplotlib.pyplot as plt
+
+        self.plt = plt
+        self.plt.ion()
+        self.fig = self.plt.figure(SPARSE_WINDOW_NAME, figsize=(10, 7))
+        self.ax = self.fig.add_subplot(111, projection="3d")
+        self.ax.view_init(elev=15, azim=-70)
+        if self.fig.canvas.manager is not None:
+            self.fig.canvas.manager.set_window_title(SPARSE_WINDOW_NAME)
+
+    def update(
+        self,
+        color_image: np.ndarray,
+        face_landmarks: list,
+        points: np.ndarray,
+        colors: np.ndarray,
+        frame: FaceFrame | None,
+    ) -> bool:
+        display_image = color_image.copy()
+        draw_2d_detection(display_image, face_landmarks)
+        cv2.imshow(RGB_WINDOW_NAME, display_image)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            return False
+
+        if not self.plt.fignum_exists(self.fig.number):
+            return False
+
+        view_angle = (self.ax.elev, self.ax.azim)
+        self.ax.cla()
+        self.configure_axis(view_angle)
+
+        all_points = []
+        if len(points) > 0:
+            self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=colors, s=5, depthshade=False)
+            all_points.append(points)
+
+        for label, start, end, color in coordinate_axes(frame):
+            axis_points = np.vstack([start, end])
+            self.ax.plot(
+                axis_points[:, 0],
+                axis_points[:, 1],
+                axis_points[:, 2],
+                color=color,
+                linewidth=4,
+                label=label,
+            )
+            self.ax.text(end[0], end[1], end[2], label.replace("face ", ""), color=color)
+            all_points.append(axis_points)
+
+        if frame is not None:
+            legend = self.ax.legend(loc="upper right")
+            for text in legend.get_texts():
+                text.set_color("white")
+            legend.get_frame().set_facecolor((0.02, 0.02, 0.025))
+            legend.get_frame().set_edgecolor((0.45, 0.45, 0.45))
+
+        self.set_equal_view(np.vstack(all_points) if all_points else np.empty((0, 3)))
+        self.fig.canvas.draw_idle()
+        self.plt.pause(0.001)
+        return True
+
+    def configure_axis(self, view_angle: tuple[float, float]) -> None:
+        self.ax.set_facecolor((0.02, 0.02, 0.025))
+        self.fig.set_facecolor((0.02, 0.02, 0.025))
+        self.ax.tick_params(colors="white")
+        self.ax.xaxis.label.set_color("white")
+        self.ax.yaxis.label.set_color("white")
+        self.ax.zaxis.label.set_color("white")
+        self.ax.set_xlabel("X meters")
+        self.ax.set_ylabel("Y meters")
+        self.ax.set_zlabel("Z meters")
+        self.ax.view_init(elev=view_angle[0], azim=view_angle[1])
+        self.ax.grid(True, color=(0.25, 0.25, 0.25))
+
+    def set_equal_view(self, points: np.ndarray) -> None:
+        if len(points) == 0:
+            self.ax.set_xlim(-0.18, 0.18)
+            self.ax.set_ylim(-0.18, 0.18)
+            self.ax.set_zlim(0.4, 1.2)
+            return
+
+        center = points.mean(axis=0)
+        span = float(np.max(np.ptp(points, axis=0)))
+        radius = max(span * 0.65, 0.18)
+        self.ax.set_xlim(center[0] - radius, center[0] + radius)
+        self.ax.set_ylim(center[1] - radius, center[1] + radius)
+        self.ax.set_zlim(center[2] - radius, center[2] + radius)
+
+    def close(self) -> None:
+        cv2.destroyAllWindows()
+        self.plt.close(self.fig)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Send a filtered MediaPipe/RealSense face coordinate frame over UDP."
@@ -280,6 +463,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-translation-jump", type=float, default=0.15, help="Reject jumps above this many meters.")
     parser.add_argument("--max-rotation-jump-deg", type=float, default=45.0, help="Reject jumps above this many degrees.")
     parser.add_argument("--print-every", type=int, default=30, help="Print one status line every N sent frames. Use 0 to disable.")
+    parser.add_argument("--visualize", action="store_true", help="Show RGB detection and sparse 3D debug windows.")
+    parser.add_argument("--cloud-stride", type=int, default=5, help="Sparse debug cloud sampling stride in pixels.")
     return parser.parse_args()
 
 
@@ -307,6 +492,7 @@ def main() -> int:
     )
     destination = (args.udp_host, args.udp_port)
     sequence = 0
+    visualizer = DebugVisualizer() if args.visualize else None
 
     print(f"Sending filtered face coordinate frames to udp://{args.udp_host}:{args.udp_port}")
     print("Press Ctrl+C to stop.")
@@ -328,17 +514,39 @@ def main() -> int:
 
                     timestamp_ms = int(time.monotonic() * 1000)
                     result = landmarker.detect_for_video(mp_image, timestamp_ms)
-                    if not result.face_landmarks:
-                        continue
-
-                    height, width = color_image.shape[:2]
-                    pixels = landmark_pixels(result.face_landmarks[0], width, height)
                     intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
-                    frame = make_face_frame(pixels, depth_frame, intrinsics)
-                    if frame is None:
-                        continue
+                    points = np.empty((0, 3))
+                    colors = np.empty((0, 3))
+                    filtered_frame = None
 
-                    filtered_frame = frame_filter.update(frame)
+                    if result.face_landmarks:
+                        height, width = color_image.shape[:2]
+                        pixels = landmark_pixels(result.face_landmarks[0], width, height)
+                        frame = make_face_frame(pixels, depth_frame, intrinsics)
+                        if frame is not None:
+                            filtered_frame = frame_filter.update(frame)
+
+                            if visualizer is not None:
+                                bounds = face_bounds(pixels, width, height)
+                                points, colors = sparse_head_cloud(
+                                    color_image,
+                                    depth_frame,
+                                    intrinsics,
+                                    bounds,
+                                    stride=args.cloud_stride,
+                                )
+
+                    if visualizer is not None:
+                        keep_running = visualizer.update(
+                            color_image,
+                            result.face_landmarks,
+                            points,
+                            colors,
+                            filtered_frame,
+                        )
+                        if not keep_running:
+                            break
+
                     if filtered_frame is None:
                         continue
 
@@ -355,6 +563,8 @@ def main() -> int:
         print("\nStopped.")
     finally:
         pipeline.stop()
+        if visualizer is not None:
+            visualizer.close()
 
     return 0
 
