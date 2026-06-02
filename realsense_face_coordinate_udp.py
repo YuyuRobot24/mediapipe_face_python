@@ -27,6 +27,16 @@ MODEL_PATH = Path("models/face_landmarker.task")
 RGB_WINDOW_NAME = "RealSense RGB Face Detection - press q to quit"
 SPARSE_WINDOW_NAME = "RealSense Sparse Face Coordinate Debug"
 AXIS_LENGTH_METERS = 0.12
+MIN_POSITION_ALPHA = 0.12
+MAX_POSITION_ALPHA = 0.65
+SLOW_POSITION_METERS = 0.003
+FAST_POSITION_METERS = 0.04
+MIN_ROTATION_ALPHA = 0.1
+MAX_ROTATION_ALPHA = 0.55
+SLOW_ROTATION_DEG = 1.0
+FAST_ROTATION_DEG = 15.0
+MAX_TRANSLATION_JUMP_METERS = 0.15
+MAX_ROTATION_JUMP_DEG = 45.0
 
 LEFT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
@@ -46,17 +56,9 @@ class FaceFrame:
 
 
 class FaceFrameFilter:
-    def __init__(
-        self,
-        position_alpha: float,
-        rotation_alpha: float,
-        max_translation_jump: float,
-        max_rotation_jump_deg: float,
-    ) -> None:
-        self.position_alpha = position_alpha
-        self.rotation_alpha = rotation_alpha
-        self.max_translation_jump = max_translation_jump
-        self.max_rotation_jump_rad = np.deg2rad(max_rotation_jump_deg)
+    def __init__(self) -> None:
+        self.max_translation_jump = MAX_TRANSLATION_JUMP_METERS
+        self.max_rotation_jump_rad = np.deg2rad(MAX_ROTATION_JUMP_DEG)
         self.previous: FaceFrame | None = None
 
     def update(self, frame: FaceFrame) -> FaceFrame | None:
@@ -69,9 +71,23 @@ class FaceFrameFilter:
         if translation_jump > self.max_translation_jump or rotation_jump > self.max_rotation_jump_rad:
             return self.previous
 
-        origin = smooth_vector(self.previous.origin, frame.origin, self.position_alpha)
-        x_axis = smooth_unit_vector(self.previous.x_axis, frame.x_axis, self.rotation_alpha)
-        y_hint = smooth_unit_vector(self.previous.y_axis, frame.y_axis, self.rotation_alpha)
+        position_alpha = adaptive_alpha(
+            translation_jump,
+            SLOW_POSITION_METERS,
+            FAST_POSITION_METERS,
+            MIN_POSITION_ALPHA,
+            MAX_POSITION_ALPHA,
+        )
+        rotation_alpha = adaptive_alpha(
+            rotation_jump,
+            np.deg2rad(SLOW_ROTATION_DEG),
+            np.deg2rad(FAST_ROTATION_DEG),
+            MIN_ROTATION_ALPHA,
+            MAX_ROTATION_ALPHA,
+        )
+        origin = smooth_vector(self.previous.origin, frame.origin, position_alpha)
+        x_axis = smooth_unit_vector(self.previous.x_axis, frame.x_axis, rotation_alpha)
+        y_hint = smooth_unit_vector(self.previous.y_axis, frame.y_axis, rotation_alpha)
         if x_axis is None or y_hint is None:
             return self.previous
 
@@ -88,8 +104,8 @@ class FaceFrameFilter:
             x_axis=x_axis,
             y_axis=y_axis,
             z_axis=z_axis,
-            left_eye_center=smooth_vector(self.previous.left_eye_center, frame.left_eye_center, self.position_alpha),
-            right_eye_center=smooth_vector(self.previous.right_eye_center, frame.right_eye_center, self.position_alpha),
+            left_eye_center=smooth_vector(self.previous.left_eye_center, frame.left_eye_center, position_alpha),
+            right_eye_center=smooth_vector(self.previous.right_eye_center, frame.right_eye_center, position_alpha),
             mouth_center=origin,
         )
         self.previous = filtered
@@ -225,6 +241,17 @@ def normalize(vector: np.ndarray) -> np.ndarray | None:
 
 def smooth_vector(previous: np.ndarray, current: np.ndarray, alpha: float) -> np.ndarray:
     return previous * (1.0 - alpha) + current * alpha
+
+
+def adaptive_alpha(
+    change: float,
+    slow_change: float,
+    fast_change: float,
+    min_alpha: float,
+    max_alpha: float,
+) -> float:
+    blend = (change - slow_change) / (fast_change - slow_change)
+    return float(min_alpha + np.clip(blend, 0.0, 1.0) * (max_alpha - min_alpha))
 
 
 def smooth_unit_vector(previous: np.ndarray, current: np.ndarray, alpha: float) -> np.ndarray | None:
@@ -458,10 +485,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--udp-host", default="127.0.0.1", help="Destination host or Docker bridge IP.")
     parser.add_argument("--udp-port", type=int, default=5005, help="Destination UDP port.")
-    parser.add_argument("--position-alpha", type=float, default=0.25, help="EMA alpha for origin and centers.")
-    parser.add_argument("--rotation-alpha", type=float, default=0.2, help="EMA alpha for coordinate axes.")
-    parser.add_argument("--max-translation-jump", type=float, default=0.15, help="Reject jumps above this many meters.")
-    parser.add_argument("--max-rotation-jump-deg", type=float, default=45.0, help="Reject jumps above this many degrees.")
     parser.add_argument("--print-every", type=int, default=30, help="Print one status line every N sent frames. Use 0 to disable.")
     parser.add_argument("--visualize", action="store_true", help="Show RGB detection and sparse 3D debug windows.")
     parser.add_argument("--cloud-stride", type=int, default=5, help="Sparse debug cloud sampling stride in pixels.")
@@ -484,12 +507,7 @@ def main() -> int:
         num_faces=1,
     )
 
-    frame_filter = FaceFrameFilter(
-        position_alpha=args.position_alpha,
-        rotation_alpha=args.rotation_alpha,
-        max_translation_jump=args.max_translation_jump,
-        max_rotation_jump_deg=args.max_rotation_jump_deg,
-    )
+    frame_filter = FaceFrameFilter()
     destination = (args.udp_host, args.udp_port)
     sequence = 0
     visualizer = DebugVisualizer() if args.visualize else None
