@@ -61,6 +61,7 @@ python realsense_face_coordinate_udp.py --udp-host 127.0.0.1 --udp-port 5005
 Use `--net=host` for the ROS 2 Docker container if you want `127.0.0.1:5005` to be shared between host and container.
 Add `--visualize` to show the RGB detection window and a sparse 3D debug map while still sending UDP packets.
 Pose smoothing adapts automatically: small changes are stabilized while deliberate movement tracks more quickly.
+If no usable face is detected, the UDP sender emits a zero origin and zero quaternion as a safety watchdog value.
 
 On the first run, the script downloads the official MediaPipe face landmarker model into `models/`.
 

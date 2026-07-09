@@ -61,6 +61,9 @@ class FaceFrameFilter:
         self.max_rotation_jump_rad = np.deg2rad(MAX_ROTATION_JUMP_DEG)
         self.previous: FaceFrame | None = None
 
+    def reset(self) -> None:
+        self.previous = None
+
     def update(self, frame: FaceFrame) -> FaceFrame | None:
         if self.previous is None:
             self.previous = frame
@@ -352,6 +355,16 @@ def frame_to_payload(frame: FaceFrame, sequence: int, timestamp_ms: int) -> dict
     }
 
 
+def zero_frame_payload(sequence: int, timestamp_ms: int) -> dict:
+    return {
+        "type": "mediapipe_face_frame",
+        "sequence": sequence,
+        "timestamp_ms": timestamp_ms,
+        "origin": [0.0, 0.0, 0.0],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 0.0],
+    }
+
+
 def coordinate_axes(
     frame: FaceFrame | None,
 ) -> list[tuple[str, np.ndarray, np.ndarray, tuple[float, float, float]]]:
@@ -566,14 +579,15 @@ def main() -> int:
                             break
 
                     if filtered_frame is None:
-                        continue
-
-                    payload = frame_to_payload(filtered_frame, sequence, timestamp_ms)
+                        frame_filter.reset()
+                        payload = zero_frame_payload(sequence, timestamp_ms)
+                    else:
+                        payload = frame_to_payload(filtered_frame, sequence, timestamp_ms)
                     udp_socket.sendto((json.dumps(payload) + "\n").encode("utf-8"), destination)
 
                     sequence += 1
                     if args.print_every and sequence % args.print_every == 0:
-                        origin = filtered_frame.origin
+                        origin = payload["origin"]
                         print(
                             f"sent={sequence} origin=({origin[0]:+.3f}, {origin[1]:+.3f}, {origin[2]:+.3f})"
                         )
