@@ -35,13 +35,19 @@ MIN_ROTATION_ALPHA = 0.1
 MAX_ROTATION_ALPHA = 0.55
 SLOW_ROTATION_DEG = 1.0
 FAST_ROTATION_DEG = 15.0
-MAX_TRANSLATION_JUMP_METERS = 0.15
 MAX_ROTATION_JUMP_DEG = 45.0
+MAX_POSITION_STEP_METERS = 0.025
+LANDMARK_DEPTH_OUTLIER_METERS = 0.035
+MAX_MISSING_DEPTH_FRAMES = 10
+MOUTH_OCCLUSION_NEAR_METERS = 0.045
+MOUTH_DEPTH_DRIFT_METERS = 0.08
 
 LEFT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+NOSE_TIP = [1, 4, 5]
 OUTER_MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
 INNER_MOUTH = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191]
+CAMERA_FORWARD = np.asarray([0.0, 0.0, 1.0], dtype=float)
 
 
 @dataclass
@@ -57,22 +63,29 @@ class FaceFrame:
 
 class FaceFrameFilter:
     def __init__(self) -> None:
-        self.max_translation_jump = MAX_TRANSLATION_JUMP_METERS
         self.max_rotation_jump_rad = np.deg2rad(MAX_ROTATION_JUMP_DEG)
         self.previous: FaceFrame | None = None
 
     def reset(self) -> None:
         self.previous = None
 
+    def current(self) -> FaceFrame | None:
+        return self.previous
+
     def update(self, frame: FaceFrame) -> FaceFrame | None:
         if self.previous is None:
             self.previous = frame
             return frame
 
-        translation_jump = np.linalg.norm(frame.origin - self.previous.origin)
+        translation_delta = frame.origin - self.previous.origin
+        translation_jump = np.linalg.norm(translation_delta)
         rotation_jump = rotation_angle(rotation_matrix(frame), rotation_matrix(self.previous))
-        if translation_jump > self.max_translation_jump or rotation_jump > self.max_rotation_jump_rad:
-            return self.previous
+        if translation_jump > MAX_POSITION_STEP_METERS:
+            frame = replace_frame_origin(
+                frame,
+                self.previous.origin + translation_delta / translation_jump * MAX_POSITION_STEP_METERS,
+            )
+            translation_jump = MAX_POSITION_STEP_METERS
 
         position_alpha = adaptive_alpha(
             translation_jump,
@@ -82,7 +95,7 @@ class FaceFrameFilter:
             MAX_POSITION_ALPHA,
         )
         rotation_alpha = adaptive_alpha(
-            rotation_jump,
+            min(rotation_jump, self.max_rotation_jump_rad),
             np.deg2rad(SLOW_ROTATION_DEG),
             np.deg2rad(FAST_ROTATION_DEG),
             MIN_ROTATION_ALPHA,
@@ -180,6 +193,17 @@ def deproject_pixel(pixel: tuple[int, int], depth_frame: rs.depth_frame, intrins
     return np.asarray([point[0], point[1], point[2]], dtype=float)
 
 
+def deproject_pixel_at_depth(pixel: tuple[float, float], depth: float, intrinsics: rs.intrinsics) -> np.ndarray:
+    point = rs.rs2_deproject_pixel_to_point(intrinsics, [pixel[0], pixel[1]], depth)
+    return np.asarray([point[0], point[1], point[2]], dtype=float)
+
+
+def centroid_pixel(landmark_indices: list[int], pixels: list[tuple[int, int]]) -> tuple[float, float]:
+    selected = np.asarray([pixels[landmark_index] for landmark_index in landmark_indices], dtype=float)
+    center = np.median(selected, axis=0)
+    return float(center[0]), float(center[1])
+
+
 def mean_landmark_point(
     landmark_indices: list[int],
     pixels: list[tuple[int, int]],
@@ -194,7 +218,47 @@ def mean_landmark_point(
 
     if len(points) < 3:
         return None
-    return np.mean(np.asarray(points), axis=0)
+
+    points_array = np.asarray(points)
+    median_z = float(np.median(points_array[:, 2]))
+    depth_error = np.abs(points_array[:, 2] - median_z)
+    inliers = points_array[depth_error <= LANDMARK_DEPTH_OUTLIER_METERS]
+    if len(inliers) < 3:
+        inliers = points_array
+
+    return np.median(inliers, axis=0)
+
+
+def mouth_point_with_face_depth_guard(
+    pixels: list[tuple[int, int]],
+    depth_frame: rs.depth_frame,
+    intrinsics: rs.intrinsics,
+    stable_face_depth: float,
+) -> np.ndarray | None:
+    raw_mouth_center = mean_landmark_point(OUTER_MOUTH + INNER_MOUTH, pixels, depth_frame, intrinsics)
+    mouth_pixel = centroid_pixel(OUTER_MOUTH + INNER_MOUTH, pixels)
+    estimated_mouth_center = deproject_pixel_at_depth(mouth_pixel, stable_face_depth, intrinsics)
+    if raw_mouth_center is None:
+        return estimated_mouth_center
+
+    depth_error = raw_mouth_center[2] - stable_face_depth
+    if depth_error < -MOUTH_OCCLUSION_NEAR_METERS or abs(depth_error) > MOUTH_DEPTH_DRIFT_METERS:
+        return estimated_mouth_center
+
+    return raw_mouth_center
+
+
+def replace_frame_origin(frame: FaceFrame, origin: np.ndarray) -> FaceFrame:
+    origin_delta = origin - frame.origin
+    return FaceFrame(
+        origin=origin,
+        x_axis=frame.x_axis,
+        y_axis=frame.y_axis,
+        z_axis=frame.z_axis,
+        left_eye_center=frame.left_eye_center + origin_delta,
+        right_eye_center=frame.right_eye_center + origin_delta,
+        mouth_center=origin,
+    )
 
 
 def sparse_head_cloud(
@@ -314,21 +378,45 @@ def make_face_frame(
 ) -> FaceFrame | None:
     right_eye_center = mean_landmark_point(RIGHT_EYE, pixels, depth_frame, intrinsics)
     left_eye_center = mean_landmark_point(LEFT_EYE, pixels, depth_frame, intrinsics)
-    mouth_center = mean_landmark_point(OUTER_MOUTH + INNER_MOUTH, pixels, depth_frame, intrinsics)
-    if right_eye_center is None or left_eye_center is None or mouth_center is None:
+    nose_tip = mean_landmark_point(NOSE_TIP, pixels, depth_frame, intrinsics)
+    if right_eye_center is None or left_eye_center is None:
         return None
 
+    stable_face_depth = float(np.median([right_eye_center[2], left_eye_center[2]]))
+    mouth_center = mouth_point_with_face_depth_guard(pixels, depth_frame, intrinsics, stable_face_depth)
+    if mouth_center is None:
+        return None
+    mouth_orientation_center = deproject_pixel_at_depth(
+        centroid_pixel(OUTER_MOUTH + INNER_MOUTH, pixels),
+        stable_face_depth,
+        intrinsics,
+    )
+
+    # Requested face frame:
+    #   +Y mouth -> eyes, +Z inward into the face, +X completes a right-handed frame.
     eye_midpoint = (right_eye_center + left_eye_center) * 0.5
-    x_axis = normalize(left_eye_center - right_eye_center)
-    y_hint = normalize(eye_midpoint - mouth_center)
-    if x_axis is None or y_hint is None:
+    y_axis = normalize(eye_midpoint - mouth_orientation_center)
+    if y_axis is None:
         return None
 
-    z_axis = normalize(np.cross(x_axis, y_hint))
+    if nose_tip is None:
+        inward_hint = CAMERA_FORWARD
+    else:
+        face_plane_center = eye_midpoint * 0.65 + mouth_orientation_center * 0.35
+        inward_hint = normalize(face_plane_center - nose_tip)
+        if inward_hint is None:
+            inward_hint = CAMERA_FORWARD
+
+    z_axis = normalize(inward_hint - y_axis * np.dot(inward_hint, y_axis))
+    if z_axis is None:
+        z_axis = normalize(CAMERA_FORWARD - y_axis * np.dot(CAMERA_FORWARD, y_axis))
     if z_axis is None:
         return None
 
-    # Make a valid orthonormal frame while keeping Y as close as possible to mouth-to-eyes.
+    x_axis = normalize(np.cross(y_axis, z_axis))
+    if x_axis is None:
+        return None
+
     y_axis = normalize(np.cross(z_axis, x_axis))
     if y_axis is None:
         return None
@@ -523,6 +611,7 @@ def main() -> int:
     frame_filter = FaceFrameFilter()
     destination = (args.udp_host, args.udp_port)
     sequence = 0
+    missing_depth_frames = 0
     visualizer = DebugVisualizer() if args.visualize else None
 
     print(f"Sending filtered face coordinate frames to udp://{args.udp_host}:{args.udp_port}")
@@ -555,17 +644,24 @@ def main() -> int:
                         pixels = landmark_pixels(result.face_landmarks[0], width, height)
                         frame = make_face_frame(pixels, depth_frame, intrinsics)
                         if frame is not None:
+                            missing_depth_frames = 0
                             filtered_frame = frame_filter.update(frame)
+                        else:
+                            missing_depth_frames += 1
+                            if missing_depth_frames <= MAX_MISSING_DEPTH_FRAMES:
+                                filtered_frame = frame_filter.current()
 
-                            if visualizer is not None:
-                                bounds = face_bounds(pixels, width, height)
-                                points, colors = sparse_head_cloud(
-                                    color_image,
-                                    depth_frame,
-                                    intrinsics,
-                                    bounds,
-                                    stride=args.cloud_stride,
-                                )
+                        if visualizer is not None:
+                            bounds = face_bounds(pixels, width, height)
+                            points, colors = sparse_head_cloud(
+                                color_image,
+                                depth_frame,
+                                intrinsics,
+                                bounds,
+                                stride=args.cloud_stride,
+                            )
+                    else:
+                        missing_depth_frames = MAX_MISSING_DEPTH_FRAMES + 1
 
                     if visualizer is not None:
                         keep_running = visualizer.update(
