@@ -41,6 +41,7 @@ LANDMARK_DEPTH_OUTLIER_METERS = 0.035
 MAX_MISSING_DEPTH_FRAMES = 10
 MOUTH_OCCLUSION_NEAR_METERS = 0.045
 MOUTH_DEPTH_DRIFT_METERS = 0.08
+FACE_X_AXIS_PITCH_BIAS_DEG = 30.0
 
 LEFT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
@@ -420,6 +421,14 @@ def make_face_frame(
     y_axis = normalize(np.cross(z_axis, x_axis))
     if y_axis is None:
         return None
+
+    pitch_bias_rad = np.deg2rad(FACE_X_AXIS_PITCH_BIAS_DEG)
+    cos_bias = np.cos(pitch_bias_rad)
+    sin_bias = np.sin(pitch_bias_rad)
+    y_axis, z_axis = (
+        y_axis * cos_bias + z_axis * sin_bias,
+        -y_axis * sin_bias + z_axis * cos_bias,
+    )
 
     return FaceFrame(
         origin=mouth_center,
